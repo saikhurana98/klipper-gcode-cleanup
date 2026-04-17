@@ -554,3 +554,15 @@ class TestNotifier:
         script = client.send_gcode.call_args[0][0]
         assert "hello" in script
         assert "RESPOND" in script
+
+
+# ── CI smoke test ─────────────────────────────────────────────────────────────
+
+
+def test_version_string_is_semver() -> None:
+    """VERSION follows semantic versioning (MAJOR.MINOR.PATCH)."""
+    import re
+
+    from cleanup import VERSION
+
+    assert re.match(r"^\d+\.\d+\.\d+$", VERSION), f"Bad version format: {VERSION}"
