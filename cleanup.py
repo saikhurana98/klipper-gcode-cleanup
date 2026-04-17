@@ -500,14 +500,22 @@ class CleanupJob:
         """
         Walk the gcodes directory bottom-up and remove any directories that
         are now empty (e.g. after all their files were moved to trash).
-        Never removes the gcodes root itself or SKIP_DIRS entries.
+
+        The top-level gcodes root and gcodes/.thumbs are never removed.
+        Nested .thumbs directories (e.g. project/.thumbs) are removed when
+        empty so their parent project directory can then also be removed.
         """
         removed = 0
+        top_level_thumbs = self._cfg.gcodes_dir / ".thumbs"
         for root, _dirs, _files in os.walk(self._cfg.gcodes_dir, topdown=False):
             root_path = Path(root)
             if root_path == self._cfg.gcodes_dir:
                 continue
-            if root_path.name in SKIP_DIRS:
+            # Never touch the top-level .thumbs — Moonraker manages it.
+            if root_path == top_level_thumbs:
+                continue
+            # gcodes_trash lives outside gcodes_dir, but guard anyway.
+            if root_path.name == "gcodes_trash":
                 continue
             if self._dry_run:
                 if not any(root_path.iterdir()):

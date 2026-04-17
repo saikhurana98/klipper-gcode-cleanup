@@ -314,15 +314,26 @@ class TestRemoveEmptyDirs:
         job._remove_empty_dirs()
         assert (tmp_path / "gcodes").exists()
 
-    def test_skip_dirs_not_removed(self, tmp_path: Path) -> None:
+    def test_top_level_thumbs_not_removed(self, tmp_path: Path) -> None:
+        """The top-level gcodes/.thumbs is always preserved (Moonraker owns it)."""
         cfg = make_config(tmp_path)
         gcodes = tmp_path / "gcodes"
-        for skip in SKIP_DIRS:
-            (gcodes / skip).mkdir(parents=True, exist_ok=True)
+        thumbs = gcodes / ".thumbs"
+        thumbs.mkdir(parents=True, exist_ok=True)
         job = CleanupJob(cfg, null_client(), null_notifier(), null_logger())
         job._remove_empty_dirs()
-        for skip in SKIP_DIRS:
-            assert (gcodes / skip).exists()
+        assert thumbs.exists()
+
+    def test_nested_thumbs_removed_when_empty(self, tmp_path: Path) -> None:
+        """A .thumbs inside a project subdir is removed when empty, freeing the parent."""
+        cfg = make_config(tmp_path)
+        gcodes = tmp_path / "gcodes"
+        nested_thumbs = gcodes / "project" / ".thumbs"
+        nested_thumbs.mkdir(parents=True, exist_ok=True)
+        job = CleanupJob(cfg, null_client(), null_notifier(), null_logger())
+        removed = job._remove_empty_dirs()
+        assert removed == 2  # .thumbs + project dir
+        assert not (gcodes / "project").exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
