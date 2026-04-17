@@ -1,0 +1,23 @@
+[project]
+name = "klipper-gcode-cleanup"
+version = "1.1.0"
+description = "Auto-stale G-code file cleanup addon for Klipper/Moonraker"
+requires-python = ">=3.11"
+dependencies = ["requests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+    "E501",  # line too long — handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cleanup"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

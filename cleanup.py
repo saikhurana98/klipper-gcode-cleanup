@@ -2,7 +2,7 @@
 """
 klipper-gcode-cleanup — Auto-stale G-code file management for Klipper/Moonraker.
 
-Normal usage (called by systemd timer every hour):
+Normal usage (called by systemd user timer every hour):
     cleanup.py
 
 The script reads ~/printer_data/config/gcode_cleanup.cfg and:
@@ -31,7 +31,6 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import requests
 
@@ -39,7 +38,7 @@ import requests
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_CONFIG_PATHS = [
     Path("/home/pi/printer_data/config/gcode_cleanup.cfg"),
@@ -47,18 +46,19 @@ DEFAULT_CONFIG_PATHS = [
 ]
 
 DEFAULT_GCODES_DIR = Path("/home/pi/printer_data/gcodes")
-DEFAULT_TRASH_DIR  = Path("/home/pi/printer_data/gcodes_trash")
-DEFAULT_LOG_FILE   = Path("/home/pi/printer_data/logs/gcode-cleanup.log")
+DEFAULT_TRASH_DIR = Path("/home/pi/printer_data/gcodes_trash")
+DEFAULT_LOG_FILE = Path("/home/pi/printer_data/logs/gcode-cleanup.log")
 
-# Directory names inside gcodes_dir that are never touched
+# Directory names inside gcodes_dir that are never descended into or removed
 SKIP_DIRS = {".thumbs", "gcodes_trash"}
 
 GCODE_EXTENSIONS = {".gcode", ".g", ".gc", ".gco"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration loader
+# Configuration
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class Config:
     """Reads gcode_cleanup.cfg and exposes typed accessors."""
@@ -82,7 +82,7 @@ class Config:
     def _getbool(self, key: str, fallback: bool) -> bool:
         return self._cfg.getboolean("gcode_cleanup", key, fallback=fallback)
 
-    # ── Schedule ─────────────────────────────────────────────────────────────
+    # ── Schedule ──────────────────────────────────────────────────────────────
     @property
     def cleanup_day(self) -> int:
         return self._getint("cleanup_day", 1)
@@ -95,7 +95,7 @@ class Config:
     def run_hour(self) -> int:
         return self._getint("run_hour", 5)
 
-    # ── Retention ────────────────────────────────────────────────────────────
+    # ── Retention ─────────────────────────────────────────────────────────────
     @property
     def min_upload_age_days(self) -> int:
         return self._getint("min_upload_age_days", 7)
@@ -104,7 +104,7 @@ class Config:
     def min_since_print_days(self) -> int:
         return self._getint("min_since_print_days", 7)
 
-    # ── Moonraker ────────────────────────────────────────────────────────────
+    # ── Moonraker ─────────────────────────────────────────────────────────────
     @property
     def moonraker_host(self) -> str:
         return self._get("moonraker_host", "localhost")
@@ -113,7 +113,7 @@ class Config:
     def moonraker_port(self) -> int:
         return self._getint("moonraker_port", 7125)
 
-    # ── Paths (optional overrides in config) ─────────────────────────────────
+    # ── Paths ─────────────────────────────────────────────────────────────────
     @property
     def gcodes_dir(self) -> Path:
         return Path(self._get("gcodes_dir", str(DEFAULT_GCODES_DIR)))
@@ -126,11 +126,25 @@ class Config:
     def log_file(self) -> Path:
         return Path(self._get("log_file", str(DEFAULT_LOG_FILE)))
 
-    # ── Notifications ────────────────────────────────────────────────────────
+    # ── Notifications: Fluidd console ─────────────────────────────────────────
     @property
     def fluidd_notifications(self) -> bool:
         return self._getbool("fluidd_notifications", True)
 
+    # ── Notifications: ntfy ───────────────────────────────────────────────────
+    @property
+    def ntfy_enabled(self) -> bool:
+        return self._getbool("ntfy_enabled", False)
+
+    @property
+    def ntfy_url(self) -> str:
+        return self._get("ntfy_url", "https://ntfy.sh").rstrip("/")
+
+    @property
+    def ntfy_topic(self) -> str:
+        return self._get("ntfy_topic", "")
+
+    # ── Notifications: Home Assistant ─────────────────────────────────────────
     @property
     def homeassistant_enabled(self) -> bool:
         return self._getbool("homeassistant_enabled", False)
@@ -152,32 +166,30 @@ class Config:
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def setup_logging(log_file: Path) -> logging.Logger:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("klipper-cleanup")
     logger.setLevel(logging.DEBUG)
 
     syslog_fmt = logging.Formatter("klipper-cleanup[%(process)d]: %(levelname)s %(message)s")
-    file_fmt   = logging.Formatter(
+    file_fmt = logging.Formatter(
         "%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S"
     )
 
-    # Syslog → picked up by journald; query: journalctl -t klipper-cleanup
     try:
         sh = logging.handlers.SysLogHandler(address="/dev/log")
         sh.setLevel(logging.INFO)
         sh.setFormatter(syslog_fmt)
         logger.addHandler(sh)
     except OSError:
-        pass  # not on a Linux system with /dev/log
+        pass
 
-    # Rotating local log (5 × 1 MB) in printer_data/logs/
     fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=1_048_576, backupCount=5)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(file_fmt)
     logger.addHandler(fh)
 
-    # stdout — captured by systemd unit's StandardOutput=journal
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("%(levelname)-8s %(message)s"))
@@ -190,9 +202,10 @@ def setup_logging(log_file: Path) -> logging.Logger:
 # Moonraker API client
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class MoonrakerClient:
     def __init__(self, host: str, port: int, timeout: int = 10):
-        self.base    = f"http://{host}:{port}"
+        self.base = f"http://{host}:{port}"
         self.timeout = timeout
         self._session = requests.Session()
         self._session.headers["Accept"] = "application/json"
@@ -208,7 +221,6 @@ class MoonrakerClient:
         return r.json()
 
     def printer_state(self) -> str:
-        """Return current print_stats state (printing | standby | idle | error | …)."""
         try:
             d = self._get("/printer/objects/query", {"print_stats": ""})
             return d["result"]["status"]["print_stats"]["state"]
@@ -217,9 +229,9 @@ class MoonrakerClient:
 
     def recent_print_jobs(self, after_ts: float) -> dict[str, float]:
         """
-        Return {filename: most_recent_start_time} for all jobs whose
-        start_time > after_ts.  Paginates descending until the batch
-        falls entirely before the cutoff.
+        Return {filename: most_recent_start_time} for jobs whose
+        start_time > after_ts. Paginates descending until results
+        fall entirely before the cutoff.
         """
         result: dict[str, float] = {}
         start = 0
@@ -242,7 +254,6 @@ class MoonrakerClient:
             for job in jobs:
                 st = job.get("start_time", 0.0)
                 if st <= after_ts:
-                    # Everything past this point is older — stop early
                     return result
                 any_recent = True
                 fname = job.get("filename", "")
@@ -256,14 +267,18 @@ class MoonrakerClient:
         return result
 
     def send_gcode(self, script: str) -> None:
-        """Execute a GCode script (RESPOND sends a message to the Fluidd console)."""
         self._post("/printer/gcode/script", {"script": script})
 
-    def notify_homeassistant(self, url: str, token: str, service: str, message: str, title: str) -> None:
+    def notify_homeassistant(
+        self, url: str, token: str, service: str, message: str, title: str
+    ) -> None:
         endpoint = f"{url}/api/services/{service.replace('.', '/')}"
         r = requests.post(
             endpoint,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
             json={"title": title, "message": message},
             timeout=10,
         )
@@ -274,15 +289,40 @@ class MoonrakerClient:
 # Notifier
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class Notifier:
     def __init__(self, cfg: Config, client: MoonrakerClient, log: logging.Logger):
-        self._cfg    = cfg
+        self._cfg = cfg
         self._client = client
-        self._log    = log
+        self._log = log
 
     def send(self, message: str, title: str = "Klipper Cleanup") -> None:
+        self._ntfy(message, title)
         self._fluidd(message)
         self._homeassistant(message, title)
+
+    def _ntfy(self, message: str, title: str) -> None:
+        if not self._cfg.ntfy_enabled:
+            return
+        topic = self._cfg.ntfy_topic
+        if not topic:
+            self._log.warning("ntfy enabled but ntfy_topic is not set in config")
+            return
+        url = f"{self._cfg.ntfy_url}/{topic}"
+        try:
+            requests.post(
+                url,
+                data=message.encode(),
+                headers={
+                    "Title": title,
+                    "Priority": "default",
+                    "Tags": "printer,broom",
+                },
+                timeout=10,
+            )
+            self._log.debug("ntfy notification sent → %s", url)
+        except Exception as exc:
+            self._log.warning("ntfy notification failed: %s", exc)
 
     def _fluidd(self, message: str) -> None:
         if not self._cfg.fluidd_notifications:
@@ -312,8 +352,9 @@ class Notifier:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cleanup job  (1st of month by default)
+# Cleanup job (1st of month by default)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class CleanupJob:
     def __init__(
@@ -324,18 +365,16 @@ class CleanupJob:
         log: logging.Logger,
         dry_run: bool = False,
     ):
-        self._cfg      = cfg
-        self._client   = client
+        self._cfg = cfg
+        self._client = client
         self._notifier = notifier
-        self._log      = log
-        self._dry_run  = dry_run
+        self._log = log
+        self._dry_run = dry_run
 
     def run(self) -> None:
-        now_ts   = time.time()
-        now_dt   = datetime.fromtimestamp(now_ts)
-        # A file is "recent" if it falls within the stricter of the two thresholds
-        upload_cutoff = now_ts - (self._cfg.min_upload_age_days  * 86_400)
-        print_cutoff  = now_ts - (self._cfg.min_since_print_days * 86_400)
+        now_ts = time.time()
+        upload_cutoff = now_ts - (self._cfg.min_upload_age_days * 86_400)
+        print_cutoff = now_ts - (self._cfg.min_since_print_days * 86_400)
 
         self._log.info(
             "=== Cleanup started | v%s | upload_cutoff=%s | print_cutoff=%s | dry_run=%s ===",
@@ -345,7 +384,6 @@ class CleanupJob:
             self._dry_run,
         )
 
-        # Safety: never run during an active print
         state = self._client.printer_state()
         if state == "printing":
             msg = "Printer is currently printing — cleanup aborted."
@@ -354,7 +392,6 @@ class CleanupJob:
             return
         self._log.info("Printer state: %s — proceeding", state)
 
-        # Fetch recent print history in one paginated sweep
         self._log.info("Querying print history ...")
         try:
             recent_prints = self._client.recent_print_jobs(print_cutoff)
@@ -368,9 +405,9 @@ class CleanupJob:
             self._notifier.send("[Cleanup] ERROR: history API unavailable. Aborted.")
             return
 
-        files    = self._discover_files()
-        moved:  list[str] = []
-        kept:   list[str] = []
+        files = self._discover_files()
+        moved: list[str] = []
+        kept: list[str] = []
         errors: list[str] = []
 
         self._log.info("Discovered %d G-code file(s)", len(files))
@@ -390,11 +427,16 @@ class CleanupJob:
                     self._log.error("ERROR trashing %s: %s", rel, exc)
                     errors.append(rel)
 
+        removed_dirs = self._remove_empty_dirs()
+        if removed_dirs:
+            self._log.info("Removed %d empty director(ies)", removed_dirs)
+
         if not self._dry_run:
             self._write_manifest(now_ts, moved, kept, errors)
 
         summary = (
-            f"[Cleanup] {len(moved)} moved to trash, {len(kept)} kept, {len(errors)} error(s)."
+            f"[Cleanup] {len(moved)} moved to trash, {len(kept)} kept, "
+            f"{removed_dirs} empty dirs removed, {len(errors)} error(s)."
         )
         self._log.info(summary)
         self._notifier.send(summary)
@@ -419,7 +461,7 @@ class CleanupJob:
         upload_cutoff: float,
         print_cutoff: float,
         recent_prints: dict[str, float],
-    ) -> Optional[str]:
+    ) -> str | None:
         mtime = path.stat().st_mtime
         if mtime > upload_cutoff:
             return f"uploaded {datetime.fromtimestamp(mtime).isoformat(timespec='seconds')}"
@@ -438,7 +480,6 @@ class CleanupJob:
         dest = self._cfg.trash_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # Avoid name collisions with a timestamp suffix
         if dest.exists():
             dest = dest.with_name(f"{dest.stem}__{int(run_ts)}{dest.suffix}")
 
@@ -455,20 +496,46 @@ class CleanupJob:
                 except Exception:
                     pass
 
+    def _remove_empty_dirs(self) -> int:
+        """
+        Walk the gcodes directory bottom-up and remove any directories that
+        are now empty (e.g. after all their files were moved to trash).
+        Never removes the gcodes root itself or SKIP_DIRS entries.
+        """
+        removed = 0
+        for root, _dirs, _files in os.walk(self._cfg.gcodes_dir, topdown=False):
+            root_path = Path(root)
+            if root_path == self._cfg.gcodes_dir:
+                continue
+            if root_path.name in SKIP_DIRS:
+                continue
+            if self._dry_run:
+                if not any(root_path.iterdir()):
+                    self._log.info("[DRY-RUN] would remove empty dir: %s", root_path)
+                    removed += 1
+                continue
+            try:
+                root_path.rmdir()  # fails silently if not empty
+                self._log.info("RMDIR %s", root_path.relative_to(self._cfg.gcodes_dir))
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     def _write_manifest(self, run_ts: float, moved: list, kept: list, errors: list) -> None:
         date_str = datetime.fromtimestamp(run_ts).strftime("%Y-%m-%d")
         manifest = self._cfg.trash_dir / f"manifest_{date_str}.json"
         with open(manifest, "w") as f:
             json.dump(
                 {
-                    "version":       VERSION,
-                    "run_time":      datetime.fromtimestamp(run_ts).isoformat(timespec="seconds"),
+                    "version": VERSION,
+                    "run_time": datetime.fromtimestamp(run_ts).isoformat(timespec="seconds"),
                     "retention": {
-                        "min_upload_age_days":  self._cfg.min_upload_age_days,
+                        "min_upload_age_days": self._cfg.min_upload_age_days,
                         "min_since_print_days": self._cfg.min_since_print_days,
                     },
-                    "moved":  moved,
-                    "kept":   kept,
+                    "moved": moved,
+                    "kept": kept,
                     "errors": errors,
                 },
                 f,
@@ -478,8 +545,9 @@ class CleanupJob:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Purge job  (7th of month by default)
+# Purge job (7th of month by default)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class PurgeJob:
     def __init__(
@@ -489,16 +557,18 @@ class PurgeJob:
         log: logging.Logger,
         dry_run: bool = False,
     ):
-        self._cfg      = cfg
+        self._cfg = cfg
         self._notifier = notifier
-        self._log      = log
-        self._dry_run  = dry_run
+        self._log = log
+        self._dry_run = dry_run
 
     def run(self) -> None:
         trash = self._cfg.trash_dir
         self._log.info(
             "=== Purge started | v%s | trash=%s | dry_run=%s ===",
-            VERSION, trash, self._dry_run,
+            VERSION,
+            trash,
+            self._dry_run,
         )
 
         if not trash.exists():
@@ -507,12 +577,10 @@ class PurgeJob:
 
         deleted_files = deleted_dirs = errors = preserved = 0
 
-        # Deepest paths first so parent dirs are empty before we rmdir them
         all_items = sorted(trash.rglob("*"), key=lambda p: len(p.parts), reverse=True)
         for item in all_items:
             if not item.exists():
                 continue
-            # Keep manifests for audit (tiny JSON, negligible disk cost)
             if item.is_file() and item.name.startswith("manifest_") and item.suffix == ".json":
                 preserved += 1
                 continue
@@ -524,7 +592,7 @@ class PurgeJob:
                     deleted_files += 1
                 elif item.is_dir():
                     try:
-                        item.rmdir()  # only succeeds when empty
+                        item.rmdir()
                         deleted_dirs += 1
                     except OSError:
                         pass
@@ -544,15 +612,18 @@ class PurgeJob:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_config(override: Optional[str]) -> Path:
+
+def resolve_config(override: str | None) -> Path:
     if override:
-        return Path(override)
+        p = Path(override)
+        if not p.exists():
+            raise FileNotFoundError(f"Config not found: {p}")
+        return p
     for candidate in DEFAULT_CONFIG_PATHS:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        "Could not find gcode_cleanup.cfg. "
-        f"Tried: {[str(p) for p in DEFAULT_CONFIG_PATHS]}"
+        f"Could not find gcode_cleanup.cfg. Tried: {[str(p) for p in DEFAULT_CONFIG_PATHS]}"
     )
 
 
@@ -562,10 +633,14 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--config",  metavar="PATH", help="Path to gcode_cleanup.cfg")
-    parser.add_argument("--cleanup", action="store_true", help="Force cleanup mode (ignore schedule)")
-    parser.add_argument("--purge",   action="store_true", help="Force purge mode   (ignore schedule)")
-    parser.add_argument("--dry-run", action="store_true", help="Log decisions without making changes")
+    parser.add_argument("--config", metavar="PATH", help="Path to gcode_cleanup.cfg")
+    parser.add_argument(
+        "--cleanup", action="store_true", help="Force cleanup mode (ignore schedule)"
+    )
+    parser.add_argument("--purge", action="store_true", help="Force purge mode (ignore schedule)")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Log decisions without making changes"
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
 
@@ -587,22 +662,21 @@ def main() -> None:
     log = setup_logging(cfg.log_file)
     log.debug("Config loaded from %s", config_path)
 
-    client   = MoonrakerClient(cfg.moonraker_host, cfg.moonraker_port)
+    client = MoonrakerClient(cfg.moonraker_host, cfg.moonraker_port)
     notifier = Notifier(cfg, client, log)
 
     now = datetime.now()
 
-    # ── Determine which mode to run ───────────────────────────────────────────
     if args.cleanup:
         mode = "cleanup"
     elif args.purge:
         mode = "purge"
     else:
-        # Auto-detect from schedule — this is the normal hourly-timer path
         if now.hour != cfg.run_hour:
             log.debug(
                 "Hour %02d ≠ configured run_hour %02d — nothing to do.",
-                now.hour, cfg.run_hour,
+                now.hour,
+                cfg.run_hour,
             )
             return
 
@@ -613,7 +687,9 @@ def main() -> None:
         else:
             log.debug(
                 "Day %d matches neither cleanup_day=%d nor purge_day=%d — nothing to do.",
-                now.day, cfg.cleanup_day, cfg.purge_day,
+                now.day,
+                cfg.cleanup_day,
+                cfg.purge_day,
             )
             return
 
