@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly trigger for Klipper G-code cleanup
+# The Python script reads gcode_cleanup.cfg and exits immediately if the
+# current day / hour don't match the configured schedule.
+# Changing cleanup_day, purge_day, or run_hour in the Fluidd config editor
+# takes effect on the next hourly tick — no timer reload needed.
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
