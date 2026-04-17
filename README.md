@@ -42,7 +42,7 @@ Add the following block to `~/printer_data/config/moonraker.conf`:
 [update_manager klipper-gcode-cleanup]
 type: git_repo
 path: ~/klipper-gcode-cleanup
-origin: https://github.com/skhurana333/klipper-gcode-cleanup.git
+origin: https://github.com/saikhurana98/klipper-gcode-cleanup.git
 primary_branch: main
 install_script: install.sh
 ```
